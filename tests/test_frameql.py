@@ -1318,3 +1318,519 @@ class TestComplexCombined:
         totals = list(result["total"])
         assert totals == sorted(totals, reverse=True)
         assert result.iloc[0]["spend_rank"] == 1
+
+
+# ═════════════════════════════════════════════════════════════
+# 22. LEAD / LAG window functions
+# ═════════════════════════════════════════════════════════════
+
+class TestLeadLag:
+    def test_lag_basic(self, payments_engine):
+        """LAG returns the previous row's value within a partition."""
+        result = payments_engine.query("""
+            SELECT user_id, amount,
+                   LAG(amount) OVER (PARTITION BY user_id ORDER BY amount) AS prev_amount
+            FROM payments
+        """)
+        assert "prev_amount" in result.columns
+        # For user_id=1 (amounts 100, 200 sorted ASC):
+        # first row  → prev=NULL, second row → prev=100
+        u1 = result[result["user_id"] == 1].sort_values("amount")
+        assert pd.isna(u1.iloc[0]["prev_amount"])
+        assert u1.iloc[1]["prev_amount"] == 100.0
+
+    def test_lead_basic(self, payments_engine):
+        """LEAD returns the next row's value within a partition."""
+        result = payments_engine.query("""
+            SELECT user_id, amount,
+                   LEAD(amount) OVER (PARTITION BY user_id ORDER BY amount) AS next_amount
+            FROM payments
+        """)
+        assert "next_amount" in result.columns
+        u1 = result[result["user_id"] == 1].sort_values("amount")
+        assert u1.iloc[0]["next_amount"] == 200.0   # 100 → 200
+        assert pd.isna(u1.iloc[1]["next_amount"])   # 200 → NULL
+
+    def test_lag_with_offset(self, payments_engine):
+        """LAG(col, offset) skips multiple rows back."""
+        result = payments_engine.query("""
+            SELECT user_id, amount,
+                   LAG(amount, 2) OVER (PARTITION BY user_id ORDER BY amount) AS two_back
+            FROM payments
+        """)
+        # user_id=1 has only 2 rows; offset=2 means always NULL
+        u1 = result[result["user_id"] == 1].sort_values("amount")
+        assert all(pd.isna(u1["two_back"]))
+
+    def test_lag_with_default(self, payments_engine):
+        """LAG(col, 1, default) substitutes default when out of bounds."""
+        result = payments_engine.query("""
+            SELECT user_id, amount,
+                   LAG(amount, 1, 0) OVER (PARTITION BY user_id ORDER BY amount) AS prev
+            FROM payments
+        """)
+        # First row per partition should have default=0 instead of NULL
+        u1 = result[result["user_id"] == 1].sort_values("amount")
+        assert u1.iloc[0]["prev"] == 0
+
+    def test_lead_with_default(self, payments_engine):
+        """LEAD(col, 1, -1) substitutes -1 when out of bounds."""
+        result = payments_engine.query("""
+            SELECT user_id, amount,
+                   LEAD(amount, 1, -1) OVER (PARTITION BY user_id ORDER BY amount) AS nxt
+            FROM payments
+        """)
+        u1 = result[result["user_id"] == 1].sort_values("amount")
+        assert u1.iloc[-1]["nxt"] == -1
+
+    def test_lag_no_partition(self, payments_engine):
+        """LAG without PARTITION BY operates over the entire result set."""
+        result = payments_engine.query("""
+            SELECT payment_id, amount,
+                   LAG(amount) OVER (ORDER BY amount) AS prev
+            FROM payments
+        """)
+        sorted_result = result.sort_values("amount").reset_index(drop=True)
+        assert pd.isna(sorted_result.iloc[0]["prev"])   # first row has no predecessor
+        assert sorted_result.iloc[1]["prev"] == sorted_result.iloc[0]["amount"]
+
+    def test_lead_no_order(self, payments_engine):
+        """LEAD without ORDER BY assigns arbitrary but non-crashing order."""
+        result = payments_engine.query("""
+            SELECT user_id, amount,
+                   LEAD(amount) OVER (PARTITION BY user_id) AS nxt
+            FROM payments
+        """)
+        assert "nxt" in result.columns
+        assert len(result) == 5
+
+    def test_lag_single_row_partition(self):
+        """Single-row partition always returns NULL for LAG."""
+        df = pd.DataFrame({"grp": [1, 2, 3], "val": [10, 20, 30]})
+        e = FrameQL({"t": df})
+        result = e.query("""
+            SELECT grp, val,
+                   LAG(val) OVER (PARTITION BY grp ORDER BY val) AS prev
+            FROM t
+        """)
+        assert all(pd.isna(result["prev"]))
+
+    def test_lag_preserves_original_row_order(self, payments_engine):
+        """LAG computation must not permanently reorder the output rows."""
+        result = payments_engine.query("""
+            SELECT user_id, amount,
+                   LAG(amount) OVER (PARTITION BY user_id ORDER BY amount DESC) AS prev
+            FROM payments
+        """)
+        # Original data order: user_id = 1, 1, 2, 2, 3
+        assert list(result["user_id"]) == [1, 1, 2, 2, 3]
+
+    def test_lag_repeated_order_values(self):
+        """Repeated ORDER BY values produce stable but implementation-defined LAG."""
+        df = pd.DataFrame({
+            "grp": [1, 1, 1],
+            "score": [10, 10, 20],  # two tied rows at 10
+        })
+        e = FrameQL({"t": df})
+        result = e.query("""
+            SELECT grp, score,
+                   LAG(score) OVER (PARTITION BY grp ORDER BY score) AS prev
+            FROM t
+        """)
+        # At least one row should have prev = NULL (the first-in-partition row)
+        assert result["prev"].isna().sum() >= 1
+
+    def test_lead_lag_combined(self):
+        """Both LEAD and LAG in the same SELECT are computed independently."""
+        df = pd.DataFrame({"id": [1, 2, 3, 4], "val": [10, 20, 30, 40]})
+        e = FrameQL({"t": df})
+        result = e.query("""
+            SELECT id, val,
+                   LAG(val)  OVER (ORDER BY id) AS prev_val,
+                   LEAD(val) OVER (ORDER BY id) AS next_val
+            FROM t
+        """)
+        result = result.sort_values("id").reset_index(drop=True)
+        assert pd.isna(result.iloc[0]["prev_val"])
+        assert result.iloc[1]["prev_val"] == 10
+        assert result.iloc[-1]["next_val"] is None or pd.isna(result.iloc[-1]["next_val"])
+        assert result.iloc[-2]["next_val"] == 40
+
+    def test_lag_in_cte(self, payments_engine):
+        """LAG inside a CTE is materialized and accessible in outer query."""
+        result = payments_engine.query("""
+            WITH lagged AS (
+                SELECT user_id, amount,
+                       LAG(amount) OVER (PARTITION BY user_id ORDER BY amount) AS prev
+                FROM payments
+            )
+            SELECT user_id, amount, prev
+            FROM lagged
+            WHERE prev IS NOT NULL
+            ORDER BY user_id, amount
+        """)
+        assert len(result) > 0
+        assert result["prev"].notna().all()
+
+
+# ═════════════════════════════════════════════════════════════
+# 23. Tuple / multi-column IN
+# ═════════════════════════════════════════════════════════════
+
+class TestTupleIn:
+    def test_tuple_in_subquery(self, engine):
+        """(user_id, amount) IN (SELECT …) returns matching rows."""
+        result = engine.query("""
+            SELECT user_id, name FROM users u
+            WHERE (u.user_id) IN (SELECT user_id FROM orders)
+        """)
+        assert set(result["user_id"]) == {1, 2, 3}
+
+    def test_two_column_tuple_in_subquery(self):
+        """(a, b) IN (SELECT x, y …) performs tuple membership correctly."""
+        left = pd.DataFrame({"id": [1, 2, 3], "code": ["A", "B", "C"]})
+        right = pd.DataFrame({"id": [1, 3], "code": ["A", "C"]})
+        e = FrameQL({"left": left, "right": right})
+        result = e.query("""
+            SELECT l.id FROM left l
+            WHERE (l.id, l.code) IN (SELECT r.id, r.code FROM right r)
+        """)
+        assert set(result["id"]) == {1, 3}
+
+    def test_tuple_in_excludes_non_matching(self):
+        """Rows NOT in the subquery result are excluded."""
+        left = pd.DataFrame({"a": [1, 2, 3], "b": [10, 20, 30]})
+        right = pd.DataFrame({"x": [1, 2], "y": [10, 99]})  # (2,20) not in right
+        e = FrameQL({"l": left, "r": right})
+        result = e.query("""
+            SELECT a FROM l
+            WHERE (a, b) IN (SELECT x, y FROM r)
+        """)
+        # (1,10) → in, (2,20) → NOT in (right has (2,99)), (3,30) → NOT in
+        assert list(result["a"]) == [1]
+
+    def test_tuple_in_literal_list(self):
+        """(a, b) IN ((v1, v2), (v3, v4)) with inline tuple literals."""
+        df = pd.DataFrame({"x": [1, 2, 3], "y": ["a", "b", "c"]})
+        e = FrameQL({"t": df})
+        result = e.query("""
+            SELECT x, y FROM t
+            WHERE (x, y) IN ((1, 'a'), (3, 'c'))
+        """)
+        assert set(result["x"]) == {1, 3}
+
+    def test_tuple_in_null_on_left_no_match(self):
+        """NULL on the left side of a tuple never matches."""
+        df = pd.DataFrame({"a": [1, None, 3], "b": [10, 20, 30]})
+        right = pd.DataFrame({"x": [1, None, 3], "y": [10, 20, 30]})
+        e = FrameQL({"l": df, "r": right})
+        result = e.query("""
+            SELECT a FROM l
+            WHERE (a, b) IN (SELECT x, y FROM r)
+        """)
+        # NULL in left → no match; 1 and 3 match
+        assert set(result["a"].dropna()) == {1, 3}
+        assert result["a"].isna().sum() == 0  # NULL row excluded
+
+    def test_tuple_in_null_on_right_no_match(self):
+        """NULL in the right-side tuple means that row never contributes a match."""
+        df = pd.DataFrame({"a": [1, 2], "b": [10, 20]})
+        right = pd.DataFrame({"x": [1, None], "y": [10, 20]})
+        e = FrameQL({"l": df, "r": right})
+        result = e.query("""
+            SELECT a FROM l
+            WHERE (a, b) IN (SELECT x, y FROM r)
+        """)
+        assert list(result["a"]) == [1]  # (2,20) doesn't match because right tuple has NULL
+
+    def test_tuple_in_duplicates_in_subquery(self):
+        """Duplicate tuples in subquery result don't affect membership semantics."""
+        df = pd.DataFrame({"a": [1, 2, 3], "b": [10, 20, 30]})
+        right = pd.DataFrame({"x": [1, 1, 1], "y": [10, 10, 10]})  # duplicates
+        e = FrameQL({"l": df, "r": right})
+        result = e.query("""
+            SELECT a FROM l
+            WHERE (a, b) IN (SELECT x, y FROM r)
+        """)
+        assert list(result["a"]) == [1]
+
+    def test_tuple_in_column_count_mismatch_raises(self):
+        """Mismatched column counts between tuple and subquery raise ValueError."""
+        df = pd.DataFrame({"a": [1], "b": [2]})
+        right = pd.DataFrame({"x": [1], "y": [2], "z": [3]})
+        e = FrameQL({"l": df, "r": right})
+        with pytest.raises(ValueError, match="column count mismatch"):
+            e.query("""
+                SELECT a FROM l
+                WHERE (a, b) IN (SELECT x, y, z FROM r)
+            """)
+
+
+# ═════════════════════════════════════════════════════════════
+# 24. Set operations (UNION / UNION ALL / INTERSECT / EXCEPT)
+# ═════════════════════════════════════════════════════════════
+
+@pytest.fixture
+def set_engine():
+    a = pd.DataFrame({"x": [1, 2, 3, 2], "y": ["a", "b", "c", "b"]})
+    b = pd.DataFrame({"x": [2, 3, 4], "y": ["b", "c", "d"]})
+    nums = pd.DataFrame({"n": [1, 2, 3, 4, 5]})
+    return FrameQL({"a": a, "b": b, "nums": nums})
+
+
+class TestSetOperations:
+    def test_union_deduplicates(self, set_engine):
+        """UNION removes duplicates across both sides."""
+        result = set_engine.query("""
+            SELECT x, y FROM a
+            UNION
+            SELECT x, y FROM b
+        """)
+        # Unique (x,y) pairs: (1,a),(2,b),(3,c),(4,d)
+        assert len(result) == 4
+        assert set(map(tuple, result.values.tolist())) == {(1,"a"),(2,"b"),(3,"c"),(4,"d")}
+
+    def test_union_all_keeps_duplicates(self, set_engine):
+        """UNION ALL preserves all rows including duplicates."""
+        result = set_engine.query("""
+            SELECT x FROM a
+            UNION ALL
+            SELECT x FROM b
+        """)
+        # a has 4 rows, b has 3 rows → 7 rows total
+        assert len(result) == 7
+
+    def test_union_deduplicates_within_side(self, set_engine):
+        """UNION also deduplicates rows that appear multiple times within one side."""
+        result = set_engine.query("""
+            SELECT x, y FROM a
+            UNION
+            SELECT x, y FROM a
+        """)
+        # Unique rows in a: (1,a),(2,b),(3,c)
+        assert len(result) == 3
+
+    def test_intersect_returns_common_rows(self, set_engine):
+        """INTERSECT returns only rows present in both queries."""
+        result = set_engine.query("""
+            SELECT x, y FROM a
+            INTERSECT
+            SELECT x, y FROM b
+        """)
+        assert set(map(tuple, result.values.tolist())) == {(2,"b"),(3,"c")}
+
+    def test_intersect_empty(self, set_engine):
+        """INTERSECT returns empty when no rows are common."""
+        result = set_engine.query("""
+            SELECT x FROM a WHERE x = 1
+            INTERSECT
+            SELECT x FROM b WHERE x = 4
+        """)
+        assert len(result) == 0
+
+    def test_except_removes_right_rows(self, set_engine):
+        """EXCEPT returns rows in left that are not in right."""
+        result = set_engine.query("""
+            SELECT x, y FROM a
+            EXCEPT
+            SELECT x, y FROM b
+        """)
+        # a has (1,a),(2,b),(3,c); b has (2,b),(3,c),(4,d) → only (1,a) remains
+        assert set(map(tuple, result.values.tolist())) == {(1,"a")}
+
+    def test_except_full_subtraction(self, set_engine):
+        """EXCEPT with entire right side present in left → empty result."""
+        result = set_engine.query("""
+            SELECT x FROM b
+            EXCEPT
+            SELECT x FROM a
+        """)
+        # b has x=2,3,4; a has x=1,2,3 → only 4 not in a
+        xs = set(result.values.flatten().tolist())
+        assert xs == {4}
+
+    def test_union_with_order_by(self, set_engine):
+        """ORDER BY applies to the final UNION result."""
+        result = set_engine.query("""
+            SELECT x FROM a
+            UNION
+            SELECT x FROM b
+            ORDER BY x DESC
+        """)
+        xs = list(result["x"])
+        assert xs == sorted(xs, reverse=True)
+
+    def test_union_with_limit(self, set_engine):
+        """LIMIT applies after UNION deduplication."""
+        result = set_engine.query("""
+            SELECT x FROM a
+            UNION
+            SELECT x FROM b
+            ORDER BY x
+            LIMIT 2
+        """)
+        assert len(result) == 2
+        assert list(result["x"]) == [1, 2]
+
+    def test_union_position_based_columns(self):
+        """Column names from left side take precedence; position-based matching."""
+        left = pd.DataFrame({"col_a": [1, 2]})
+        right = pd.DataFrame({"col_b": [3, 4]})
+        e = FrameQL({"l": left, "r": right})
+        result = e.query("SELECT col_a FROM l UNION ALL SELECT col_b FROM r")
+        # Result columns should be named after left side
+        assert "col_a" in result.columns
+        assert set(result["col_a"]) == {1, 2, 3, 4}
+
+    def test_union_column_count_mismatch_raises(self):
+        """Column count mismatch between UNION sides raises ValueError."""
+        left = pd.DataFrame({"a": [1], "b": [2]})
+        right = pd.DataFrame({"x": [3]})
+        e = FrameQL({"l": left, "r": right})
+        with pytest.raises(ValueError, match="column count mismatch"):
+            e.query("SELECT a, b FROM l UNION SELECT x FROM r")
+
+    def test_union_with_null(self):
+        """UNION correctly deduplicates rows containing NULL values."""
+        df = pd.DataFrame({"v": [1, None, 3]})
+        e = FrameQL({"t": df})
+        result = e.query("SELECT v FROM t UNION SELECT v FROM t")
+        # Should deduplicate; NULL appears once
+        assert len(result) == 3
+
+    def test_intersect_with_null(self):
+        """INTERSECT treats NULL = NULL (set semantics)."""
+        a = pd.DataFrame({"v": [1, None, 3]})
+        b = pd.DataFrame({"v": [None, 3, 4]})
+        e = FrameQL({"a": a, "b": b})
+        result = e.query("SELECT v FROM a INTERSECT SELECT v FROM b")
+        # NULL and 3 are in both
+        assert len(result) == 2
+
+    def test_except_with_null(self):
+        """EXCEPT correctly excludes rows with matching NULL."""
+        a = pd.DataFrame({"v": [1, None, 3]})
+        b = pd.DataFrame({"v": [None]})
+        e = FrameQL({"a": a, "b": b})
+        result = e.query("SELECT v FROM a EXCEPT SELECT v FROM b")
+        # NULL removed by EXCEPT
+        non_null = result["v"].dropna()
+        assert set(non_null) == {1, 3}
+        assert result["v"].isna().sum() == 0
+
+    def test_chained_union(self, set_engine):
+        """Chained UNION operations work correctly."""
+        result = set_engine.query("""
+            SELECT x FROM a WHERE x = 1
+            UNION
+            SELECT x FROM a WHERE x = 2
+            UNION
+            SELECT x FROM b WHERE x = 4
+        """)
+        assert set(result["x"]) == {1, 2, 4}
+
+    def test_cte_with_union(self, payments_engine):
+        """CTE body may itself be a UNION."""
+        result = payments_engine.query("""
+            WITH combined AS (
+                SELECT user_id, amount FROM payments WHERE status = 'paid'
+                UNION ALL
+                SELECT user_id, amount FROM payments WHERE status = 'pending'
+            )
+            SELECT COUNT(*) AS total_rows FROM combined
+        """)
+        assert result.iloc[0]["total_rows"] == 5  # all 5 rows (paid + pending)
+
+    def test_union_inside_subquery(self, set_engine):
+        """UNION result used as a subquery in FROM clause."""
+        result = set_engine.query("""
+            SELECT x FROM (
+                SELECT x FROM a WHERE x < 3
+                UNION
+                SELECT x FROM b WHERE x > 2
+            ) sub
+            ORDER BY x
+        """)
+        xs = sorted(set(result["x"].tolist()))
+        assert 1 in xs
+        assert 3 in xs
+        assert 4 in xs
+
+
+# ═════════════════════════════════════════════════════════════
+# 25. Combined: LEAD/LAG + Tuple IN + Set ops + CTEs
+# ═════════════════════════════════════════════════════════════
+
+class TestCombinedNewFeatures:
+    def test_lag_in_cte_then_set_op(self, payments_engine):
+        """CTE with LAG, then UNION result with another query."""
+        result = payments_engine.query("""
+            WITH lagged AS (
+                SELECT user_id, amount,
+                       LAG(amount) OVER (PARTITION BY user_id ORDER BY amount) AS prev
+                FROM payments
+            )
+            SELECT user_id FROM lagged WHERE prev IS NOT NULL
+            UNION
+            SELECT user_id FROM lagged WHERE prev IS NULL
+        """)
+        # UNION of complementary sets = all distinct user_ids
+        assert set(result["user_id"]) == {1, 2, 3}
+
+    def test_tuple_in_with_cte(self, engine):
+        """Tuple IN where right side is a CTE-backed subquery."""
+        result = engine.query("""
+            WITH valid_pairs AS (
+                SELECT user_id, amount FROM orders WHERE amount > 20
+            )
+            SELECT o.user_id, o.amount
+            FROM orders o
+            WHERE (o.user_id, o.amount) IN (SELECT user_id, amount FROM valid_pairs)
+            ORDER BY o.user_id, o.amount
+        """)
+        assert all(result["amount"] > 20)
+
+    def test_set_op_with_window_in_subquery(self, payments_engine):
+        """Window function inside a subquery used in a UNION branch."""
+        result = payments_engine.query("""
+            SELECT user_id, amount FROM (
+                SELECT user_id, amount,
+                       ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY amount DESC) AS rn
+                FROM payments
+            ) ranked WHERE rn = 1
+            UNION ALL
+            SELECT user_id, amount FROM payments WHERE amount = 300
+        """)
+        assert len(result) > 0
+        assert all(result["amount"].notna())
+
+    def test_lead_then_intersect(self, payments_engine):
+        """Rows selected by LEAD condition intersected with another filter."""
+        result = payments_engine.query("""
+            WITH with_lead AS (
+                SELECT user_id, amount,
+                       LEAD(amount) OVER (PARTITION BY user_id ORDER BY amount) AS nxt
+                FROM payments
+            )
+            SELECT user_id FROM with_lead WHERE nxt IS NOT NULL
+            INTERSECT
+            SELECT user_id FROM payments WHERE status = 'paid'
+        """)
+        assert len(result) >= 1
+        assert result["user_id"].notna().all()
+
+    def test_except_after_window_filter(self, payments_engine):
+        """EXCEPT removes window-function-filtered rows from a base set."""
+        result = payments_engine.query("""
+            SELECT user_id FROM payments
+            EXCEPT
+            SELECT user_id FROM (
+                SELECT user_id,
+                       ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY amount DESC) AS rn
+                FROM payments
+            ) w WHERE rn = 1 AND user_id = 1
+        """)
+        # user_id=1's top row is excluded, but user_id=2,3 remain
+        # (EXCEPT deduplicates, so user_id=1 may still appear from other rows
+        #  unless we're only looking at distinct user_ids)
+        assert len(result) >= 1

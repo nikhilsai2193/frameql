@@ -40,12 +40,14 @@ class AggSpec:
 class WindowSpec:
     """Specification for a single window function."""
     source_sql: str          # full window expression SQL — key for resolution_map
-    func: str                # "row_number", "rank", "dense_rank", "sum", "mean"
-    func_arg: Optional[str]  # for SUM/AVG: resolved source column name
+    func: str                # "row_number", "rank", "dense_rank", "sum", "mean", "lag", "lead", …
+    func_arg: Optional[str]  # for SUM/AVG/MIN/MAX/LAG/LEAD: resolved source column name
     partition_cols: List[str]
     order_cols: List[str]
     order_asc: List[bool]
     output_col: str          # internal temp column name in df
+    lag_lead_offset: int = 1     # LAG/LEAD offset (default 1)
+    lag_lead_default: Any = None # LAG/LEAD out-of-bounds fill (default NULL)
 
 
 @dataclass
@@ -86,6 +88,7 @@ class FrameQL:
         outer_scope = outer_scope or {}
 
         # Execute CTEs in order and register results as temporary tables.
+        # CTEs may appear on any statement type including set operations.
         cte_names: List[str] = []
         with_node = tree.args.get("with_") or tree.args.get("with")
         if with_node:
@@ -96,17 +99,24 @@ class FrameQL:
                 cte_names.append(cte_name)
 
         try:
+            # Set operations (UNION / UNION ALL / INTERSECT / EXCEPT)
+            if isinstance(tree, (exp.Union, exp.Intersect, exp.Except)):
+                return self._execute_set_op(tree, outer_scope)
+
             df, scope = self._execute_joins(tree, outer_scope)
 
             # Replace uncorrelated subqueries with literals so they are not
             # re-executed row-by-row later.  Skip subqueries inside EXISTS,
-            # ANY, or ALL — those need special runtime handling.
+            # ANY, ALL, or multi-column Tuple IN — those need runtime handling.
             from_node = tree.args.get("from") or tree.args.get("from_")
             local_aliases = set(scope.keys()) - set(outer_scope.keys())
             for subq in list(tree.find_all(exp.Subquery)):
                 if subq.parent is from_node:
                     continue
                 if isinstance(subq.parent, (exp.Exists, exp.Any, exp.All)):
+                    continue
+                # Skip literal-replacement for multi-column (tuple) IN subqueries
+                if isinstance(subq.parent, exp.In) and isinstance(subq.parent.this, exp.Tuple):
                     continue
                 if not self._is_correlated(subq, local_aliases, outer_scope):
                     sub_result = self.query(subq.this.sql(), outer_scope=scope)
@@ -174,6 +184,89 @@ class FrameQL:
                     subquery.replace(exp.Literal.number(float(val)))
                 else:
                     subquery.replace(exp.Literal.string(str(val)))
+
+    # ── set operations ────────────────────────────────────────────────────────
+
+    def _execute_set_op(
+        self, tree, outer_scope: Dict[str, Any]
+    ) -> pd.DataFrame:
+        """Execute UNION / UNION ALL / INTERSECT / EXCEPT."""
+        left_df = self.query(tree.this.sql(), outer_scope=outer_scope)
+        right_df = self.query(tree.expression.sql(), outer_scope=outer_scope)
+
+        if left_df.shape[1] != right_df.shape[1]:
+            raise ValueError(
+                f"Set operation column count mismatch: "
+                f"left={left_df.shape[1]}, right={right_df.shape[1]}"
+            )
+
+        # Column matching is position-based; rename right columns to match left.
+        right_df = right_df.copy()
+        right_df.columns = left_df.columns
+
+        def _make_hashable(row: tuple) -> tuple:
+            """Normalize NaN → None so NULLs are equal in set semantics."""
+            return tuple(
+                None if (v is None or (isinstance(v, float) and np.isnan(v))) else v
+                for v in row
+            )
+
+        if isinstance(tree, exp.Union):
+            distinct = tree.args.get("distinct", True)
+            result = pd.concat([left_df, right_df], ignore_index=True)
+            if distinct is not False:
+                # UNION: remove duplicates (NULLs count as equal)
+                result = result.drop_duplicates().reset_index(drop=True)
+            # else UNION ALL: keep all rows as-is
+
+        elif isinstance(tree, exp.Intersect):
+            # Rows present in both sides; deduplicated using set semantics.
+            right_set = {_make_hashable(tuple(r)) for r in right_df.values.tolist()}
+            mask = [_make_hashable(tuple(r)) in right_set for r in left_df.values.tolist()]
+            result = left_df[mask].drop_duplicates().reset_index(drop=True)
+
+        elif isinstance(tree, exp.Except):
+            # Rows in left but not in right; deduplicated.
+            right_set = {_make_hashable(tuple(r)) for r in right_df.values.tolist()}
+            mask = [_make_hashable(tuple(r)) not in right_set for r in left_df.values.tolist()]
+            result = left_df[mask].drop_duplicates().reset_index(drop=True)
+
+        else:
+            raise NotImplementedError(f"Unsupported set operation: {type(tree).__name__}")
+
+        # ORDER BY applies to the final set-operation result.
+        order_node = tree.args.get("order")
+        if order_node:
+            sort_cols: List[str] = []
+            sort_asc: List[bool] = []
+            for ord_expr in order_node.expressions:
+                actual = ord_expr.this
+                asc = not ord_expr.args.get("desc", False)
+                # Position-based: ORDER BY 1
+                if isinstance(actual, exp.Literal) and not actual.is_string:
+                    pos = int(actual.this) - 1
+                    if 0 <= pos < len(result.columns):
+                        sort_cols.append(result.columns[pos])
+                        sort_asc.append(asc)
+                elif isinstance(actual, exp.Column):
+                    col_name = actual.name.lower()
+                    for c in result.columns:
+                        if str(c).lower() == col_name or str(c).lower().endswith(f".{col_name}"):
+                            sort_cols.append(c)
+                            sort_asc.append(asc)
+                            break
+                elif actual.sql() in result.columns:
+                    sort_cols.append(actual.sql())
+                    sort_asc.append(asc)
+            if sort_cols:
+                result = result.sort_values(sort_cols, ascending=sort_asc).reset_index(drop=True)
+
+        # LIMIT
+        limit_node = tree.args.get("limit")
+        if limit_node:
+            result = result.head(int(limit_node.expression.this))
+
+        return result
 
     # ── JOIN execution ────────────────────────────────────────────────────────
 
@@ -383,6 +476,8 @@ class FrameQL:
             exp.Count: "count",
             exp.Min: "min",
             exp.Max: "max",
+            exp.Lag: "lag",
+            exp.Lead: "lead",
         }
         win_counter = 0
         for expr in plan.select:
@@ -396,6 +491,9 @@ class FrameQL:
                     continue
 
                 func_arg: Optional[str] = None
+                lag_lead_offset: int = 1
+                lag_lead_default: Any = None
+
                 if func in ("sum", "mean", "min", "max"):
                     if isinstance(func_node.this, exp.Column):
                         inner = func_node.this
@@ -412,6 +510,30 @@ class FrameQL:
                         func_arg = self._resolve_col(df, inner.name, ta)
                     else:
                         func_arg = "__count_star__"
+                elif func in ("lag", "lead"):
+                    if isinstance(func_node.this, exp.Column):
+                        inner = func_node.this
+                        ta = inner.table.lower() if inner.table else None
+                        func_arg = self._resolve_col(df, inner.name, ta)
+                    offset_node = func_node.args.get("offset")
+                    if offset_node and isinstance(offset_node, exp.Literal):
+                        try:
+                            lag_lead_offset = int(float(offset_node.this))
+                        except (ValueError, TypeError):
+                            pass
+                    default_node = func_node.args.get("default")
+                    if default_node and not isinstance(default_node, exp.Null):
+                        try:
+                            d = self._evaluate_expr(default_node, {})
+                            # Fallthrough returns SQL string; convert if possible.
+                            if isinstance(d, str):
+                                try:
+                                    d = int(d) if "." not in d else float(d)
+                                except (ValueError, TypeError):
+                                    pass
+                            lag_lead_default = d
+                        except Exception:
+                            pass
 
                 # Resolve PARTITION BY columns
                 partition_cols: List[str] = []
@@ -452,6 +574,8 @@ class FrameQL:
                     order_cols=order_cols,
                     order_asc=order_asc,
                     output_col=out_col,
+                    lag_lead_offset=lag_lead_offset,
+                    lag_lead_default=lag_lead_default,
                 ))
 
         # Resolve GROUP BY columns to physical names
@@ -725,6 +849,37 @@ class FrameQL:
                     else:
                         df[spec.output_col] = df[src].count()
 
+            elif spec.func in ("lag", "lead") and spec.func_arg:
+                # Positional navigation: sort by (partition, order), shift, restore order.
+                col = spec.func_arg
+                offset = spec.lag_lead_offset
+                default = spec.lag_lead_default
+                # LAG looks back (positive pandas shift); LEAD looks forward (negative).
+                shift_n = offset if spec.func == "lag" else -offset
+
+                orig_idx = "__win_orig_idx__"
+                df[orig_idx] = range(len(df))
+
+                if oc:
+                    sort_cols = (pc if pc else []) + oc
+                    sort_asc = ([True] * len(pc)) + oa
+                    df = df.sort_values(sort_cols, ascending=sort_asc)
+
+                if pc:
+                    shifted = df.groupby(pc, sort=False)[col].shift(shift_n)
+                else:
+                    shifted = df[col].shift(shift_n)
+
+                if default is not None:
+                    shifted = shifted.fillna(default)
+
+                df[spec.output_col] = shifted
+                df = (
+                    df.sort_values(orig_idx)
+                    .drop(columns=[orig_idx])
+                    .reset_index(drop=True)
+                )
+
         return df
 
     def _execute_select(
@@ -899,6 +1054,13 @@ class FrameQL:
             val = self._evaluate_expr(expr.this, scope, resolution_map)
             return ~val if hasattr(val, "__invert__") else not val
 
+        # Unary negation  (e.g. -1 as LEAD/LAG default)
+        if isinstance(expr, exp.Neg):
+            val = self._evaluate_expr(expr.this, scope, resolution_map)
+            if isinstance(val, (int, float, np.integer, np.floating)):
+                return -val
+            return val
+
         # Parenthesis
         if isinstance(expr, exp.Paren):
             return self._evaluate_expr(expr.this, scope, resolution_map)
@@ -961,6 +1123,11 @@ class FrameQL:
             # Non-correlated: execute once and broadcast
             r = self.query(sql, outer_scope=scope)
             return np.full(len(primary), len(r) > 0)
+
+        # Multi-column tuple IN: (a, b) IN (SELECT x, y …) or (a, b) IN ((v1,v2), …)
+        # Must be checked before the row-by-row dispatch so the subquery runs once.
+        if isinstance(cond, exp.In) and isinstance(cond.this, exp.Tuple):
+            return self._eval_tuple_in(cond.this, cond, scope, resolution_map)
 
         # Row-level evaluation for correlated subqueries
         primary = list(scope.values())[0]
@@ -1037,6 +1204,73 @@ class FrameQL:
         if isinstance(cond, exp.LTE): return l_val <= r_val
 
         return False
+
+    def _eval_tuple_in(self, tuple_node, in_node, scope, resolution_map):
+        """Evaluate (col1, col2, …) IN (subquery | literal-tuple-list)."""
+        col_exprs = tuple_node.expressions
+
+        def _norm(v):
+            """Normalize NaN/None → None for consistent NULL semantics."""
+            if v is None:
+                return None
+            if isinstance(v, float) and np.isnan(v):
+                return None
+            return v
+
+        # Build the right-side set of hashable tuples.
+        subq_node = in_node.args.get("query") or in_node.args.get("field")
+        if subq_node:
+            sql = (
+                subq_node.this.sql()
+                if isinstance(subq_node, exp.Subquery)
+                else subq_node.sql()
+            )
+            primary = next((v for v in scope.values() if isinstance(v, pd.DataFrame)), None)
+            # Correlated subquery: evaluate per row.
+            if primary is not None and self._is_correlated(subq_node, set(scope.keys()), {}):
+                def row_check(row):
+                    rs = {k: row for k in scope}
+                    return self._eval_tuple_in(tuple_node, in_node, rs, resolution_map)
+                return primary.apply(row_check, axis=1)
+            sub_df = self.query(sql, outer_scope=scope)
+            if sub_df.shape[1] != len(col_exprs):
+                raise ValueError(
+                    f"Tuple IN column count mismatch: "
+                    f"left has {len(col_exprs)}, subquery returns {sub_df.shape[1]}"
+                )
+            # NULL on right side never matches (SQL IN semantics).
+            right_set = frozenset(
+                t for t in (
+                    tuple(_norm(v) for v in row)
+                    for row in sub_df.values.tolist()
+                )
+                if None not in t
+            )
+        else:
+            right_set = set()
+            for lit_tuple in in_node.args.get("expressions", []):
+                if isinstance(lit_tuple, exp.Tuple):
+                    vals = tuple(
+                        _norm(self._evaluate_expr(e, scope, resolution_map))
+                        for e in lit_tuple.expressions
+                    )
+                    if None not in vals:
+                        right_set.add(vals)
+            right_set = frozenset(right_set)
+
+        # Evaluate left columns.
+        left_cols = [self._evaluate_expr(c, scope, resolution_map) for c in col_exprs]
+
+        if all(isinstance(c, pd.Series) for c in left_cols):
+            rows = list(zip(*[c.tolist() for c in left_cols]))
+            result = [
+                (None not in (_norm(v) for v in t)) and (tuple(_norm(v) for v in t) in right_set)
+                for t in rows
+            ]
+            return pd.Series(result, index=left_cols[0].index)
+        else:
+            t = tuple(_norm(v) for v in left_cols)
+            return (None not in t) and (t in right_set)
 
     def _execute_case(self, expr, scope, resolution_map=None):
         conditions, choices = [], []
