@@ -271,6 +271,11 @@ class FrameQL:
         lkeys, rkeys = [], []
         for eq in on_cond.find_all(exp.EQ):
             lc, rc = eq.left, eq.right
+            # Only treat as equi-join key when BOTH sides are column references.
+            # Literal comparisons (e.g. r.rn = 1) are residual conditions handled
+            # as post-join filters, not as merge keys.
+            if not isinstance(lc, exp.Column) or not isinstance(rc, exp.Column):
+                continue
             lt = lc.table.lower() if getattr(lc, "table", None) else ""
             rt = rc.table.lower() if getattr(rc, "table", None) else ""
             ln = getattr(lc, "name", lc.sql())
@@ -375,6 +380,9 @@ class FrameQL:
             exp.DenseRank: "dense_rank",
             exp.Sum: "sum",
             exp.Avg: "mean",
+            exp.Count: "count",
+            exp.Min: "min",
+            exp.Max: "max",
         }
         win_counter = 0
         for expr in plan.select:
@@ -388,10 +396,22 @@ class FrameQL:
                     continue
 
                 func_arg: Optional[str] = None
-                if func in ("sum", "mean") and isinstance(func_node.this, exp.Column):
+                if func in ("sum", "mean", "min", "max"):
+                    if isinstance(func_node.this, exp.Column):
+                        inner = func_node.this
+                        ta = inner.table.lower() if inner.table else None
+                        func_arg = self._resolve_col(df, inner.name, ta)
+                elif func == "count":
                     inner = func_node.this
-                    ta = inner.table.lower() if inner.table else None
-                    func_arg = self._resolve_col(df, inner.name, ta)
+                    if isinstance(inner, (exp.Star, exp.Literal)) or inner is None:
+                        func_arg = "__count_star__"
+                    elif isinstance(inner, exp.Distinct):
+                        func_arg = "__count_star__"
+                    elif isinstance(inner, exp.Column):
+                        ta = inner.table.lower() if inner.table else None
+                        func_arg = self._resolve_col(df, inner.name, ta)
+                    else:
+                        func_arg = "__count_star__"
 
                 # Resolve PARTITION BY columns
                 partition_cols: List[str] = []
@@ -652,12 +672,22 @@ class FrameQL:
             oa = spec.order_asc
 
             if spec.func == "row_number":
+                # Preserve original row order: sort to compute, then restore.
+                orig_idx = "__win_orig_idx__"
+                df[orig_idx] = range(len(df))
                 if oc:
-                    df = df.sort_values(oc, ascending=oa).reset_index(drop=True)
+                    sort_cols = (pc if pc else []) + oc
+                    sort_asc = ([True] * len(pc)) + oa
+                    df = df.sort_values(sort_cols, ascending=sort_asc)
                 if pc:
-                    df[spec.output_col] = df.groupby(pc).cumcount() + 1
+                    df[spec.output_col] = df.groupby(pc, sort=False).cumcount() + 1
                 else:
                     df[spec.output_col] = range(1, len(df) + 1)
+                df = (
+                    df.sort_values(orig_idx)
+                    .drop(columns=[orig_idx])
+                    .reset_index(drop=True)
+                )
 
             elif spec.func in ("rank", "dense_rank"):
                 method = "min" if spec.func == "rank" else "dense"
@@ -675,13 +705,25 @@ class FrameQL:
                 else:
                     df[spec.output_col] = 1.0
 
-            elif spec.func in ("sum", "mean") and spec.func_arg:
+            elif spec.func in ("sum", "mean", "min", "max") and spec.func_arg:
                 if pc:
                     df[spec.output_col] = df.groupby(pc)[spec.func_arg].transform(
                         spec.func
                     )
                 else:
-                    df[spec.output_col] = getattr(df[spec.func_arg], spec.func)()
+                    agg_val = getattr(df[spec.func_arg], spec.func)()
+                    df[spec.output_col] = agg_val
+
+            elif spec.func == "count":
+                src = spec.func_arg
+                if pc:
+                    ref_col = pc[0] if (src is None or src == "__count_star__") else src
+                    df[spec.output_col] = df.groupby(pc)[ref_col].transform("count")
+                else:
+                    if src is None or src == "__count_star__":
+                        df[spec.output_col] = len(df)
+                    else:
+                        df[spec.output_col] = df[src].count()
 
         return df
 
