@@ -37,6 +37,18 @@ class AggSpec:
 
 
 @dataclass
+class WindowSpec:
+    """Specification for a single window function."""
+    source_sql: str          # full window expression SQL — key for resolution_map
+    func: str                # "row_number", "rank", "dense_rank", "sum", "mean"
+    func_arg: Optional[str]  # for SUM/AVG: resolved source column name
+    partition_cols: List[str]
+    order_cols: List[str]
+    order_asc: List[bool]
+    output_col: str          # internal temp column name in df
+
+
+@dataclass
 class QueryPlan:
     select: List
     where: Any = None
@@ -48,6 +60,7 @@ class QueryPlan:
     distinct: bool = False
     resolution_map: Dict[str, str] = field(default_factory=dict)
     agg_specs: List[AggSpec] = field(default_factory=list)
+    window_specs: List[WindowSpec] = field(default_factory=list)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -72,23 +85,40 @@ class FrameQL:
         tree = sqlglot.parse_one(sql)
         outer_scope = outer_scope or {}
 
-        df, scope = self._execute_joins(tree, outer_scope)
+        # Execute CTEs in order and register results as temporary tables.
+        cte_names: List[str] = []
+        with_node = tree.args.get("with_") or tree.args.get("with")
+        if with_node:
+            for cte in with_node.expressions:
+                cte_name = (cte.alias or "cte").lower()
+                cte_df = self.query(cte.this.sql(), outer_scope=outer_scope)
+                self.tables[cte_name] = cte_df
+                cte_names.append(cte_name)
 
-        # Replace uncorrelated subqueries with literals so they are not
-        # re-executed row-by-row later.
-        from_node = tree.args.get("from") or tree.args.get("from_")
-        local_aliases = set(scope.keys()) - set(outer_scope.keys())
-        for subq in list(tree.find_all(exp.Subquery)):
-            if subq.parent is from_node:
-                continue
-            if not self._is_correlated(subq, local_aliases, outer_scope):
-                sub_result = self.query(subq.this.sql(), outer_scope=scope)
-                self._replace_subquery_with_literal(subq, sub_result)
+        try:
+            df, scope = self._execute_joins(tree, outer_scope)
 
-        plan = self._build_plan(tree, df)
-        # Pass outer_scope so _execute_plan knows which scope keys must not
-        # be overwritten when syncing the local DataFrame across pipeline stages.
-        return self._execute_plan(df, plan, scope, outer_scope=outer_scope)
+            # Replace uncorrelated subqueries with literals so they are not
+            # re-executed row-by-row later.  Skip subqueries inside EXISTS,
+            # ANY, or ALL — those need special runtime handling.
+            from_node = tree.args.get("from") or tree.args.get("from_")
+            local_aliases = set(scope.keys()) - set(outer_scope.keys())
+            for subq in list(tree.find_all(exp.Subquery)):
+                if subq.parent is from_node:
+                    continue
+                if isinstance(subq.parent, (exp.Exists, exp.Any, exp.All)):
+                    continue
+                if not self._is_correlated(subq, local_aliases, outer_scope):
+                    sub_result = self.query(subq.this.sql(), outer_scope=scope)
+                    self._replace_subquery_with_literal(subq, sub_result)
+
+            plan = self._build_plan(tree, df)
+            # Pass outer_scope so _execute_plan knows which scope keys must not
+            # be overwritten when syncing the local DataFrame across pipeline stages.
+            return self._execute_plan(df, plan, scope, outer_scope=outer_scope)
+        finally:
+            for name in cte_names:
+                self.tables.pop(name, None)
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -338,6 +368,72 @@ class FrameQL:
                 )
                 seen[raw] = out_col
 
+        # Scan SELECT for window functions
+        _WIN_FUNCS = {
+            exp.RowNumber: "row_number",
+            exp.Rank: "rank",
+            exp.DenseRank: "dense_rank",
+            exp.Sum: "sum",
+            exp.Avg: "mean",
+        }
+        win_counter = 0
+        for expr in plan.select:
+            for win in expr.find_all(exp.Window):
+                raw = win.sql()
+                if raw in plan.resolution_map:
+                    continue
+                func_node = win.this
+                func = _WIN_FUNCS.get(type(func_node))
+                if func is None:
+                    continue
+
+                func_arg: Optional[str] = None
+                if func in ("sum", "mean") and isinstance(func_node.this, exp.Column):
+                    inner = func_node.this
+                    ta = inner.table.lower() if inner.table else None
+                    func_arg = self._resolve_col(df, inner.name, ta)
+
+                # Resolve PARTITION BY columns
+                partition_cols: List[str] = []
+                pb_raw = win.args.get("partition_by") or []
+                pb_list = pb_raw.expressions if hasattr(pb_raw, "expressions") else (
+                    pb_raw if isinstance(pb_raw, list) else [pb_raw] if pb_raw else []
+                )
+                for p in pb_list:
+                    if isinstance(p, exp.Column):
+                        ta = p.table.lower() if p.table else None
+                        partition_cols.append(self._resolve_col(df, p.name, ta))
+                    else:
+                        partition_cols.append(p.sql())
+
+                # Resolve ORDER BY columns
+                order_cols: List[str] = []
+                order_asc: List[bool] = []
+                order_node = win.args.get("order")
+                if order_node:
+                    for ord_expr in order_node.expressions:
+                        actual = ord_expr.this
+                        asc = not ord_expr.args.get("desc", False)
+                        if isinstance(actual, exp.Column):
+                            ta = actual.table.lower() if actual.table else None
+                            order_cols.append(self._resolve_col(df, actual.name, ta))
+                        else:
+                            order_cols.append(actual.sql())
+                        order_asc.append(asc)
+
+                out_col = f"__win_{win_counter}__"
+                win_counter += 1
+                plan.resolution_map[raw] = out_col
+                plan.window_specs.append(WindowSpec(
+                    source_sql=raw,
+                    func=func,
+                    func_arg=func_arg,
+                    partition_cols=partition_cols,
+                    order_cols=order_cols,
+                    order_asc=order_asc,
+                    output_col=out_col,
+                ))
+
         # Resolve GROUP BY columns to physical names
         for i, g in enumerate(plan.group_by_exprs):
             g_sql = g.sql()
@@ -385,6 +481,11 @@ class FrameQL:
         if plan.group_by_exprs:
             df = self._execute_groupby(df, plan, scope)
 
+        # 2.5 Window functions — computed after GROUP BY, before SELECT
+        if plan.window_specs:
+            df = self._execute_windows(df, plan, scope)
+            sync(df)
+
         # 3. HAVING
         if plan.having:
             sync(df)
@@ -400,6 +501,11 @@ class FrameQL:
         # 4. SELECT projection
         sync(df)
         df = self._execute_select(df, plan, scope)
+        # Drop internal window temp columns (visible only when SELECT * is used)
+        df = df.drop(
+            columns=[c for c in df.columns if str(c).startswith("__win_")],
+            errors="ignore",
+        )
 
         # 5. DISTINCT
         if plan.distinct:
@@ -536,6 +642,49 @@ class FrameQL:
                     return node
         return None
 
+    def _execute_windows(
+        self, df: pd.DataFrame, plan: QueryPlan, scope: Dict
+    ) -> pd.DataFrame:
+        df = df.copy()
+        for spec in plan.window_specs:
+            pc = spec.partition_cols
+            oc = spec.order_cols
+            oa = spec.order_asc
+
+            if spec.func == "row_number":
+                if oc:
+                    df = df.sort_values(oc, ascending=oa).reset_index(drop=True)
+                if pc:
+                    df[spec.output_col] = df.groupby(pc).cumcount() + 1
+                else:
+                    df[spec.output_col] = range(1, len(df) + 1)
+
+            elif spec.func in ("rank", "dense_rank"):
+                method = "min" if spec.func == "rank" else "dense"
+                if oc:
+                    col_to_rank = oc[0]
+                    asc = oa[0] if oa else True
+                    if pc:
+                        df[spec.output_col] = df.groupby(pc)[col_to_rank].rank(
+                            method=method, ascending=asc
+                        )
+                    else:
+                        df[spec.output_col] = df[col_to_rank].rank(
+                            method=method, ascending=asc
+                        )
+                else:
+                    df[spec.output_col] = 1.0
+
+            elif spec.func in ("sum", "mean") and spec.func_arg:
+                if pc:
+                    df[spec.output_col] = df.groupby(pc)[spec.func_arg].transform(
+                        spec.func
+                    )
+                else:
+                    df[spec.output_col] = getattr(df[spec.func_arg], spec.func)()
+
+        return df
+
     def _execute_select(
         self,
         df: pd.DataFrame,
@@ -571,6 +720,12 @@ class FrameQL:
             all_scalar = all(
                 not isinstance(v, (pd.Series, np.ndarray)) for v in new_cols.values()
             )
+            # If all values are scalars but WHERE filtered the table to empty,
+            # return an empty frame rather than a phantom one-row result.
+            # Exception: aggregate queries (agg_specs non-empty) always return
+            # one row even over an empty table (SQL standard for bare aggregates).
+            if all_scalar and len(df) == 0 and not plan.agg_specs:
+                return pd.DataFrame(columns=order)
             idx = [0] if all_scalar else df.index
             result = pd.DataFrame(new_cols, index=idx)[order]
         else:
@@ -636,7 +791,12 @@ class FrameQL:
             if ta and ta in scope:
                 target = scope[ta]
             else:
-                target = list(scope.values())[0]
+                # For unqualified columns, prefer the inner query's own DataFrame
+                # over any outer-row Series injected via outer_scope.
+                target = next(
+                    (v for v in scope.values() if isinstance(v, pd.DataFrame)),
+                    list(scope.values())[0],
+                )
             col = self._resolve_col(target, expr.name, ta)
             if isinstance(target, pd.DataFrame):
                 return target[col]
@@ -739,6 +899,27 @@ class FrameQL:
                 return l_val.notna() if hasattr(l_val, "notna") else l_val is not None
             return l_val == self._evaluate_expr(rhs, scope, resolution_map)
 
+        # EXISTS / NOT EXISTS
+        if isinstance(cond, exp.Exists):
+            subq = cond.this
+            sql = subq.this.sql() if isinstance(subq, exp.Subquery) else subq.sql()
+            primary = list(scope.values())[0]
+            is_row = isinstance(primary, pd.Series)
+            if is_row:
+                # Already in row-wise mode: execute subquery with this row as outer scope
+                r = self.query(sql, outer_scope=scope)
+                return len(r) > 0
+            # Vectorised mode: check correlation and dispatch accordingly
+            local_aliases = set(scope.keys())
+            if self._is_correlated(subq, local_aliases, {}):
+                def _row_exists(row):
+                    rs = {k: row for k in scope}
+                    return self._eval_condition(cond, rs, resolution_map)
+                return primary.apply(_row_exists, axis=1).astype(bool)
+            # Non-correlated: execute once and broadcast
+            r = self.query(sql, outer_scope=scope)
+            return np.full(len(primary), len(r) > 0)
+
         # Row-level evaluation for correlated subqueries
         primary = list(scope.values())[0]
         is_row = isinstance(primary, pd.Series)
@@ -773,6 +954,37 @@ class FrameQL:
 
         # Standard comparisons
         r_node = cond.args.get("expression") or cond.args.get("right")
+
+        # ANY / ALL quantifiers: x > ANY (subquery) / x > ALL (subquery)
+        if isinstance(r_node, (exp.Any, exp.All)):
+            subq = r_node.this
+            sql = subq.this.sql() if isinstance(subq, exp.Subquery) else subq.sql()
+            sub_df = self.query(sql, outer_scope=scope)
+            vals = sub_df.iloc[:, 0].tolist() if not sub_df.empty else []
+            is_any = isinstance(r_node, exp.Any)
+
+            if not vals:
+                # ANY over empty set → False; ALL over empty set → True
+                result_scalar = not is_any
+                if isinstance(l_val, pd.Series):
+                    return pd.Series([result_scalar] * len(l_val), index=l_val.index)
+                return result_scalar
+
+            def _quantify(lv):
+                results = []
+                for v in vals:
+                    if isinstance(cond, exp.GT):  results.append(lv > v)
+                    elif isinstance(cond, exp.GTE): results.append(lv >= v)
+                    elif isinstance(cond, exp.LT):  results.append(lv < v)
+                    elif isinstance(cond, exp.LTE): results.append(lv <= v)
+                    elif isinstance(cond, exp.EQ):  results.append(lv == v)
+                    elif isinstance(cond, exp.NEQ): results.append(lv != v)
+                return any(results) if is_any else all(results)
+
+            if isinstance(l_val, pd.Series):
+                return l_val.apply(_quantify)
+            return _quantify(l_val)
+
         r_val = self._evaluate_expr(r_node, scope, resolution_map)
 
         if isinstance(cond, exp.EQ):  return l_val == r_val

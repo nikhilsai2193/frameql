@@ -565,3 +565,225 @@ class TestKnownBugFixes:
         assert list(result.columns) == ["name", "total_spent"]
         totals = list(result["total_spent"])
         assert totals == sorted(totals, reverse=True)
+
+
+# ─────────────────────────────────────────────────────────────
+# 13. EXISTS / NOT EXISTS
+# ─────────────────────────────────────────────────────────────
+
+class TestExists:
+    def test_exists(self, engine):
+        """EXISTS returns users who have at least one order."""
+        result = engine.query("""
+            SELECT name
+            FROM users u
+            WHERE EXISTS (
+                SELECT 1 FROM orders o WHERE o.user_id = u.user_id
+            )
+        """)
+        assert set(result["name"]) == {"Alice", "Bob", "Charlie"}
+        assert len(result) == 3
+
+    def test_not_exists(self, engine):
+        """NOT EXISTS returns users who have no orders."""
+        result = engine.query("""
+            SELECT name
+            FROM users u
+            WHERE NOT EXISTS (
+                SELECT 1 FROM orders o WHERE o.user_id = u.user_id
+            )
+        """)
+        assert set(result["name"]) == {"David"}
+        assert len(result) == 1
+
+    def test_exists_non_correlated(self, engine):
+        """Non-correlated EXISTS: true for all rows when subquery returns rows."""
+        result = engine.query("""
+            SELECT user_id FROM users
+            WHERE EXISTS (SELECT 1 FROM orders WHERE amount > 10)
+        """)
+        assert len(result) == 4  # all users — subquery always returns rows
+
+    def test_not_exists_non_correlated(self, engine):
+        """Non-correlated NOT EXISTS: false for all rows when subquery returns rows."""
+        result = engine.query("""
+            SELECT user_id FROM users
+            WHERE NOT EXISTS (SELECT 1 FROM orders WHERE amount > 10)
+        """)
+        assert len(result) == 0  # no users — subquery always returns rows
+
+
+# ─────────────────────────────────────────────────────────────
+# 14. ANY / ALL
+# ─────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def any_all_engine():
+    products = pd.DataFrame({
+        "product_id": [1, 2, 3, 4],
+        "name": ["Widget", "Gadget", "Doohickey", "Thingamajig"],
+        "price": [9.99, 19.99, 4.99, 14.99],
+    })
+    discounts = pd.DataFrame({
+        "discount_id": [1, 2, 3],
+        "price": [5.00, 8.00, 12.00],
+    })
+    return FrameQL({"products": products, "discounts": discounts})
+
+
+class TestAnyAll:
+    def test_all(self, any_all_engine):
+        """price > ALL(discount prices) means price > max(discount prices) = 12."""
+        result = any_all_engine.query("""
+            SELECT name, price FROM products
+            WHERE price > ALL (SELECT price FROM discounts)
+        """)
+        assert all(result["price"] > 12.0)
+        assert set(result["name"]) == {"Gadget", "Thingamajig"}
+
+    def test_any(self, any_all_engine):
+        """price > ANY(discount prices) means price > min(discount prices) = 5."""
+        result = any_all_engine.query("""
+            SELECT name, price FROM products
+            WHERE price > ANY (SELECT price FROM discounts)
+        """)
+        assert all(result["price"] > 5.0)
+        assert set(result["name"]) == {"Widget", "Gadget", "Thingamajig"}
+
+    def test_any_empty_subquery(self):
+        """ANY over an empty subquery always returns False."""
+        df = pd.DataFrame({"x": [1, 2, 3]})
+        empty = pd.DataFrame({"v": pd.Series([], dtype=float)})
+        e = FrameQL({"t": df, "empty": empty})
+        result = e.query("SELECT x FROM t WHERE x > ANY (SELECT v FROM empty)")
+        assert len(result) == 0
+
+    def test_all_empty_subquery(self):
+        """ALL over an empty subquery always returns True (vacuous truth)."""
+        df = pd.DataFrame({"x": [1, 2, 3]})
+        empty = pd.DataFrame({"v": pd.Series([], dtype=float)})
+        e = FrameQL({"t": df, "empty": empty})
+        result = e.query("SELECT x FROM t WHERE x > ALL (SELECT v FROM empty)")
+        assert len(result) == 3  # all rows pass vacuous ALL
+
+
+# ─────────────────────────────────────────────────────────────
+# 15. Window Functions
+# ─────────────────────────────────────────────────────────────
+
+class TestWindowFunctions:
+    def test_row_number_partition_order(self, payments_engine):
+        """ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY amount)."""
+        result = payments_engine.query("""
+            SELECT user_id,
+                   amount,
+                   ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY amount) AS rn
+            FROM payments
+        """)
+        assert "rn" in result.columns
+        # Within each user partition, rn should start at 1
+        for uid, grp in result.groupby("user_id"):
+            sorted_grp = grp.sort_values("amount")
+            assert list(sorted_grp["rn"]) == list(range(1, len(grp) + 1))
+
+    def test_row_number_values(self, payments_engine):
+        """Verify exact ROW_NUMBER values per user."""
+        result = payments_engine.query("""
+            SELECT user_id, amount,
+                   ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY amount) AS rn
+            FROM payments
+            ORDER BY user_id, amount
+        """)
+        # user_id=1: amounts 100→rn=1, 200→rn=2
+        u1 = result[result["user_id"] == 1].sort_values("amount")
+        assert list(u1["rn"]) == [1, 2]
+        # user_id=2: amounts 50→rn=1, 150→rn=2
+        u2 = result[result["user_id"] == 2].sort_values("amount")
+        assert list(u2["rn"]) == [1, 2]
+        # user_id=3: single row → rn=1
+        u3 = result[result["user_id"] == 3]
+        assert list(u3["rn"]) == [1]
+
+    def test_sum_over_partition(self, payments_engine):
+        """SUM(amount) OVER (PARTITION BY user_id) gives per-user total per row."""
+        result = payments_engine.query("""
+            SELECT user_id, amount,
+                   SUM(amount) OVER (PARTITION BY user_id) AS user_total
+            FROM payments
+        """)
+        assert "user_total" in result.columns
+        # user_id=1 total = 300
+        assert all(result[result["user_id"] == 1]["user_total"] == 300.0)
+        # user_id=2 total = 200
+        assert all(result[result["user_id"] == 2]["user_total"] == 200.0)
+        # user_id=3 total = 300
+        assert all(result[result["user_id"] == 3]["user_total"] == 300.0)
+
+    def test_window_no_temp_cols_leaked(self, payments_engine):
+        """Internal __win_* columns must not appear in SELECT * output."""
+        result = payments_engine.query("""
+            SELECT user_id,
+                   ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY amount) AS rn
+            FROM payments
+        """)
+        for col in result.columns:
+            assert not str(col).startswith("__win_"), f"Window temp col leaked: {col}"
+
+
+# ─────────────────────────────────────────────────────────────
+# 16. Common Table Expressions (CTEs)
+# ─────────────────────────────────────────────────────────────
+
+class TestCTE:
+    def test_simple_cte(self, payments_engine):
+        """Basic CTE: compute totals then filter."""
+        result = payments_engine.query("""
+            WITH totals AS (
+                SELECT user_id, SUM(amount) AS total
+                FROM payments
+                GROUP BY user_id
+            )
+            SELECT user_id, total FROM totals
+            WHERE total > 100
+        """)
+        assert all(result["total"] > 100)
+        assert len(result) == 3  # all users have total > 100
+
+    def test_cte_filter_strict(self, payments_engine):
+        """CTE with stricter filter."""
+        result = payments_engine.query("""
+            WITH totals AS (
+                SELECT user_id, SUM(amount) AS total
+                FROM payments
+                GROUP BY user_id
+            )
+            SELECT user_id, total FROM totals
+            WHERE total > 250
+        """)
+        # user1=300, user2=200, user3=300 → only user1 and user3 pass
+        assert all(result["total"] > 250)
+        assert len(result) == 2
+
+    def test_chained_ctes(self, payments_engine):
+        """Second CTE can reference first CTE."""
+        result = payments_engine.query("""
+            WITH totals AS (
+                SELECT user_id, SUM(amount) AS total
+                FROM payments
+                GROUP BY user_id
+            ),
+            big_spenders AS (
+                SELECT user_id, total FROM totals WHERE total >= 300
+            )
+            SELECT user_id FROM big_spenders
+        """)
+        assert len(result) == 2  # user_id 1 (300) and 3 (300)
+        assert set(result["user_id"]) == {1, 3}
+
+    def test_cte_cleanup(self, payments_engine):
+        """CTE name must not pollute the engine's table registry after query."""
+        payments_engine.query("""
+            WITH temp_cte AS (SELECT user_id FROM payments)
+            SELECT user_id FROM temp_cte
+        """)
+        assert "temp_cte" not in payments_engine.tables
