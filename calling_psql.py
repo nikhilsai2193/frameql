@@ -87,12 +87,26 @@ engine = FrameQL({
 print("--- TEST 1: INNER JOIN ---")
 # Only returns users who have orders
 sql_inner="""
-select user_id, name,
-case
-when user_id = 1 then 'not Alice'
-when user_id = 2 then 'maybe alice'
-end as random_column
-from users
+SELECT u1.user_id,
+       u1.name,
+
+       CASE
+           WHEN (
+               SELECT SUM(o1.amount)
+               FROM orders o1
+               WHERE o1.user_id = u1.user_id
+           ) > 50 THEN 'high'
+
+           WHEN (
+               SELECT SUM(o2.amount)
+               FROM orders o2
+               WHERE o2.user_id = u1.user_id
+           )  in (0) THEN 'no_orders'
+
+           ELSE 'low'
+       END AS spending_category
+
+FROM users u1;
 """
 
 
