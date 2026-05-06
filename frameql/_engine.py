@@ -70,6 +70,22 @@ class QueryPlan:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class FrameQL:
+    """SQL query engine that executes queries directly on Pandas DataFrames.
+
+    Parameters
+    ----------
+    tables : dict[str, pd.DataFrame]
+        Mapping of table name to DataFrame. Names are case-insensitive.
+
+    Examples
+    --------
+    >>> import pandas as pd
+    >>> from frameql import FrameQL
+    >>> users = pd.DataFrame({"id": [1, 2], "name": ["Alice", "Bob"]})
+    >>> engine = FrameQL({"users": users})
+    >>> engine.query("SELECT name FROM users WHERE id = 1")
+    """
+
     AGG_MAP = {
         exp.Sum: "sum",
         exp.Min: "min",
@@ -84,6 +100,19 @@ class FrameQL:
     # ── public API ────────────────────────────────────────────────────────────
 
     def query(self, sql: str, outer_scope: Dict[str, Any] = None) -> pd.DataFrame:
+        """Execute a SELECT SQL query and return the result as a DataFrame.
+
+        Parameters
+        ----------
+        sql : str
+            A SQL SELECT statement.
+        outer_scope : dict, optional
+            Internal parameter for correlated subquery execution.
+
+        Returns
+        -------
+        pd.DataFrame
+        """
         tree = sqlglot.parse_one(sql)
         outer_scope = outer_scope or {}
 
@@ -129,6 +158,31 @@ class FrameQL:
         finally:
             for name in cte_names:
                 self.tables.pop(name, None)
+
+    def execute(self, sql: str) -> Optional[pd.DataFrame]:
+        """Execute SQL — routes DML (INSERT/UPDATE/DELETE) or falls back to query().
+
+        Parameters
+        ----------
+        sql : str
+            A SQL statement (SELECT, INSERT, UPDATE, or DELETE).
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Returns a DataFrame for SELECT queries; None for DML statements.
+        """
+        tree = sqlglot.parse_one(sql)
+        if isinstance(tree, exp.Insert):
+            self._execute_insert(tree)
+            return None
+        elif isinstance(tree, exp.Update):
+            self._execute_update(tree)
+            return None
+        elif isinstance(tree, exp.Delete):
+            self._execute_delete(tree)
+            return None
+        return self.query(sql)
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -1271,22 +1325,6 @@ class FrameQL:
         else:
             t = tuple(_norm(v) for v in left_cols)
             return (None not in t) and (t in right_set)
-
-    # ── DML public API ────────────────────────────────────────────────────────
-
-    def execute(self, sql: str) -> Optional[pd.DataFrame]:
-        """Execute SQL — routes DML (INSERT/UPDATE/DELETE) or falls back to query()."""
-        tree = sqlglot.parse_one(sql)
-        if isinstance(tree, exp.Insert):
-            self._execute_insert(tree)
-            return None
-        elif isinstance(tree, exp.Update):
-            self._execute_update(tree)
-            return None
-        elif isinstance(tree, exp.Delete):
-            self._execute_delete(tree)
-            return None
-        return self.query(sql)
 
     # ── DML helpers ───────────────────────────────────────────────────────────
 
