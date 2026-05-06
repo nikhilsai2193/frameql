@@ -1272,6 +1272,228 @@ class FrameQL:
             t = tuple(_norm(v) for v in left_cols)
             return (None not in t) and (t in right_set)
 
+    # ── DML public API ────────────────────────────────────────────────────────
+
+    def execute(self, sql: str) -> Optional[pd.DataFrame]:
+        """Execute SQL — routes DML (INSERT/UPDATE/DELETE) or falls back to query()."""
+        tree = sqlglot.parse_one(sql)
+        if isinstance(tree, exp.Insert):
+            self._execute_insert(tree)
+            return None
+        elif isinstance(tree, exp.Update):
+            self._execute_update(tree)
+            return None
+        elif isinstance(tree, exp.Delete):
+            self._execute_delete(tree)
+            return None
+        return self.query(sql)
+
+    # ── DML helpers ───────────────────────────────────────────────────────────
+
+    def _resolve_col_raw(self, df: pd.DataFrame, name: str) -> str:
+        """Resolve a bare column name against a raw (un-prefixed) DataFrame."""
+        nl = name.lower()
+        for c in df.columns:
+            if str(c).lower() == nl:
+                return c
+        return name
+
+    def _scalar_eval(self, expr) -> Any:
+        """Evaluate a scalar expression (literals, arithmetic) with no DataFrame context."""
+        if expr is None or isinstance(expr, exp.Null):
+            return None
+        if isinstance(expr, exp.Literal):
+            if expr.is_string:
+                return expr.this
+            try:
+                return float(expr.this) if "." in expr.this else int(expr.this)
+            except ValueError:
+                return expr.this
+        if isinstance(expr, exp.Neg):
+            val = self._scalar_eval(expr.this)
+            return -val if isinstance(val, (int, float)) else val
+        if isinstance(expr, exp.Paren):
+            return self._scalar_eval(expr.this)
+        if isinstance(expr, (exp.Add, exp.Sub, exp.Mul, exp.Div)):
+            l = self._scalar_eval(expr.left)
+            r = self._scalar_eval(expr.right)
+            if l is None or r is None:
+                return None
+            if isinstance(expr, exp.Add): return l + r
+            if isinstance(expr, exp.Sub): return l - r
+            if isinstance(expr, exp.Mul): return l * r
+            if isinstance(expr, exp.Div): return l / r
+        # Fallback: try full evaluation with a single dummy row
+        dummy = pd.DataFrame([{"__x__": 0}])
+        result = self._evaluate_expr(expr, {"__t__": dummy})
+        if isinstance(result, pd.Series):
+            return result.iloc[0] if len(result) else None
+        return result
+
+    def _dml_scope(self, raw_df: pd.DataFrame, alias: str) -> Dict:
+        """Create a prefixed-column scope from a raw DataFrame for DML evaluation."""
+        pf = raw_df.copy()
+        pf.columns = [f"{alias}.{c}" for c in raw_df.columns]
+        return {alias: pf}
+
+    def _preprocess_dml_cond(self, cond_node):
+        """
+        Return a copy of a WHERE condition with all uncorrelated IN-subqueries
+        replaced by literal lists.  This mirrors the preprocessing that query()
+        performs before _eval_condition is called during SELECT execution.
+        """
+        import copy as _copy
+        node = _copy.deepcopy(cond_node)
+        for subq in list(node.find_all(exp.Subquery)):
+            parent = subq.parent
+            if parent is None:
+                continue
+            if isinstance(parent, (exp.Exists, exp.Any, exp.All)):
+                continue
+            if isinstance(parent, exp.In) and isinstance(parent.this, exp.Tuple):
+                continue
+            # Only replace non-correlated scalar / IN subqueries
+            if not self._is_correlated(subq, set(), {}):
+                try:
+                    sub_result = self.query(subq.this.sql())
+                    self._replace_subquery_with_literal(subq, sub_result)
+                except Exception:
+                    pass  # leave as-is if the subquery can't be pre-executed
+        return node
+
+    # ── INSERT ────────────────────────────────────────────────────────────────
+
+    def _execute_insert(self, tree: exp.Insert):
+        # tree.this is Schema (columns specified) or Table (no columns)
+        schema_or_table = tree.this
+        if hasattr(schema_or_table, 'expressions') and not isinstance(schema_or_table, exp.Table):
+            # Schema node: table in .this, column identifiers in .expressions
+            table_node = schema_or_table.this
+            col_names_raw = [c.name for c in schema_or_table.expressions]
+        else:
+            table_node = schema_or_table
+            col_names_raw = None  # resolved after table lookup
+
+        table_name = table_node.name.lower()
+
+        if table_name not in self.tables:
+            raise ValueError(f"Table '{table_name}' does not exist")
+
+        df = self.tables[table_name]
+        col_names = col_names_raw if col_names_raw else list(df.columns)
+
+        source = tree.args.get("expression")
+
+        if isinstance(source, exp.Values):
+            rows = []
+            for tup in source.expressions:
+                vals = [self._scalar_eval(v) for v in tup.expressions]
+                row = dict(zip(col_names, vals))
+                rows.append({col: row.get(col, np.nan) for col in df.columns})
+            if rows:
+                self.tables[table_name] = pd.concat(
+                    [df, pd.DataFrame(rows, columns=df.columns)],
+                    ignore_index=True,
+                )
+        else:
+            # INSERT ... SELECT
+            result = self.query(source.sql())
+            if result.shape[1] != len(col_names):
+                raise ValueError(
+                    f"INSERT column count mismatch: "
+                    f"target has {len(col_names)}, SELECT returns {result.shape[1]}"
+                )
+            result = result.copy()
+            result.columns = col_names
+            rows = [
+                {col: row.get(col, np.nan) for col in df.columns}
+                for _, row in result.iterrows()
+            ]
+            if rows:
+                self.tables[table_name] = pd.concat(
+                    [df, pd.DataFrame(rows, columns=df.columns)],
+                    ignore_index=True,
+                )
+
+    # ── UPDATE ────────────────────────────────────────────────────────────────
+
+    def _execute_update(self, tree: exp.Update):
+        table_node = tree.this
+        table_name = table_node.name.lower()
+        alias = table_node.alias.lower() if table_node.alias else table_name
+
+        if table_name not in self.tables:
+            raise ValueError(f"Table '{table_name}' does not exist")
+
+        raw_df = self.tables[table_name].copy()
+
+        # Compute WHERE mask on original data
+        where_node = tree.args.get("where")
+        if where_node:
+            cond = self._preprocess_dml_cond(where_node.this)
+            scope = self._dml_scope(raw_df, alias)
+            mask = self._eval_condition(cond, scope)
+            if not isinstance(mask, (pd.Series, np.ndarray)):
+                mask = np.full(len(raw_df), bool(mask))
+            if isinstance(mask, pd.Series):
+                mask = mask.values.astype(bool)
+        else:
+            mask = np.ones(len(raw_df), dtype=bool)
+
+        # Apply SET clauses sequentially (each clause sees the latest raw_df state)
+        for set_expr in tree.args.get("expressions", []):
+            target = set_expr.left
+            target_col = target.name if isinstance(target, exp.Column) else target.sql()
+            actual_col = self._resolve_col_raw(raw_df, target_col)
+
+            scope = self._dml_scope(raw_df, alias)
+            rhs = self._evaluate_expr(set_expr.right, scope)
+
+            indices = raw_df.index[mask]
+            if isinstance(rhs, pd.Series):
+                rhs_vals = rhs.values
+                raw_df.loc[indices, actual_col] = rhs_vals[mask]
+            elif isinstance(rhs, np.ndarray):
+                raw_df.loc[indices, actual_col] = rhs[mask]
+            else:
+                raw_df.loc[indices, actual_col] = rhs
+
+        self.tables[table_name] = raw_df
+
+    # ── DELETE ────────────────────────────────────────────────────────────────
+
+    def _execute_delete(self, tree: exp.Delete):
+        from_part = tree.this
+        if isinstance(from_part, exp.From):
+            table_node = from_part.this
+        elif isinstance(from_part, exp.Table):
+            table_node = from_part
+        else:
+            raise ValueError(f"Cannot determine DELETE target: {tree.sql()}")
+
+        table_name = table_node.name.lower()
+        alias = table_node.alias.lower() if table_node.alias else table_name
+
+        if table_name not in self.tables:
+            raise ValueError(f"Table '{table_name}' does not exist")
+
+        raw_df = self.tables[table_name]
+        where_node = tree.args.get("where")
+
+        if not where_node:
+            self.tables[table_name] = raw_df.iloc[0:0].copy().reset_index(drop=True)
+            return
+
+        cond = self._preprocess_dml_cond(where_node.this)
+        scope = self._dml_scope(raw_df, alias)
+        mask = self._eval_condition(cond, scope)
+        if not isinstance(mask, (pd.Series, np.ndarray)):
+            mask = np.full(len(raw_df), bool(mask))
+        if isinstance(mask, pd.Series):
+            mask = mask.values.astype(bool)
+
+        self.tables[table_name] = raw_df[~mask].reset_index(drop=True)
+
     def _execute_case(self, expr, scope, resolution_map=None):
         conditions, choices = [], []
         for if_node in expr.args.get("ifs", []):
