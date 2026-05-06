@@ -7,10 +7,7 @@ Run with:  pytest tests/test_frameql.py -v
 import pytest
 import pandas as pd
 import numpy as np
-import sys, os
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from FrameQL import FrameQL
+from frameql import FrameQL
 
 
 # ─────────────────────────────────────────────────────────────
